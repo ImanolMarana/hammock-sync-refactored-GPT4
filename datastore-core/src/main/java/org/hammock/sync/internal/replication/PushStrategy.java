@@ -192,109 +192,98 @@ public class PushStrategy implements ReplicationStrategy {
             AttachmentException, DocumentStoreException {
         logger.info("Push replication started");
         long startTime = System.currentTimeMillis();
-
-        // We were cancelled before we started
+    
         if (this.state.cancel) {
             return;
         }
-
+    
         if (!this.targetDb.exists()) {
-            throw new DatabaseNotFoundException(
-                    "Database not found: " + this.targetDb.getIdentifier());
+            throw new DatabaseNotFoundException("Database not found: " + this.targetDb.getIdentifier());
         }
-
+    
         this.state.documentCounter = 0;
         while (!this.state.cancel) {
             this.state.batchCounter++;
-
-
-            String msg = String.format(
-                    "Batch %s started (completed %s changes so far)",
-                    this.state.batchCounter,
-                    this.state.documentCounter
-            );
-            logger.info(msg);
+    
+            logBatchStart(this.state.batchCounter, this.state.documentCounter);
             long batchStartTime = System.currentTimeMillis();
-
-            // Get the next batch of changes and record the size and last sequence
+    
             Changes changes = getNextBatch();
             final int unfilteredChangesSize = changes.getResults().size();
             final long lastSeq = changes.getLastSequence();
-
-            // Count the number of changes processed
-            int changesProcessed = 0;
-
-            // If there is a filter replace the changes with the filtered list of changes
+    
             if (this.filter != null) {
-                List<DocumentRevision> allowedChanges = new ArrayList<DocumentRevision>(changes
-                        .getResults().size());
-
-                for (DocumentRevision revision : changes.getResults()) {
-                    if (this.filter.shouldReplicateDocument(revision)) {
-                        allowedChanges.add(revision);
-                    }
-                }
-
-                changes = new FilteredChanges(changes.getLastSequence(), allowedChanges);
+                changes = applyFilter(changes);
             }
-            final int filteredChangesSize = changes.getResults().size();
-
-            // So we can check whether all changes were processed during
-            // a log analysis.
-            msg = String.format(
-                    "Batch %s contains %s changes",
-                    this.state.batchCounter,
-                    filteredChangesSize
-            );
-            logger.info(msg);
-
+            int filteredChangesSize = changes.getResults().size();
+    
+            logBatchDetails(this.state.batchCounter, filteredChangesSize);
+            int changesProcessed = 0;
             if (filteredChangesSize > 0) {
-                changesProcessed = processOneChangesBatch(changes);
+                changesProcessed = processChangesBatch(changes);
                 this.state.documentCounter += changesProcessed;
             }
-
-            // If not cancelled and there were any changes set a checkpoint
+    
             if (!this.state.cancel && unfilteredChangesSize > 0) {
-                try {
-                    this.putCheckpoint(String.valueOf(lastSeq));
-                } catch (DocumentStoreException e) {
-                    logger.log(Level.WARNING, "Failed to put checkpoint doc, next replication " +
-                            "will " +
-                            "start from previous checkpoint", e);
-                }
+                handleCheckpoint(lastSeq);
             }
-
-            long batchEndTime = System.currentTimeMillis();
-            msg = String.format(
-                    "Batch %s completed in %sms (processed %s changes)",
-                    this.state.batchCounter,
-                    batchEndTime - batchStartTime,
-                    changesProcessed
-            );
-            logger.info(msg);
-
-            // This logic depends on the changes in the feed rather than the
-            // changes we actually processed.
+    
+            logBatchCompletion(this.state.batchCounter, changesProcessed, batchStartTime);
+    
             if (unfilteredChangesSize == 0) {
                 break;
             }
         }
-
+    
+        logReplicationCompletion(startTime);
+    }
+    
+    private Changes applyFilter(Changes changes) throws ExecutionException, InterruptedException {
+        List<DocumentRevision> allowedChanges = new ArrayList<>();
+        for (DocumentRevision revision : changes.getResults()) {
+            if (this.filter.shouldReplicateDocument(revision)) {
+                allowedChanges.add(revision);
+            }
+        }
+        return new FilteredChanges(changes.getLastSequence(), allowedChanges);
+    }
+    
+    private void logBatchStart(int batchCounter, int documentCounter) {
+        String msg = String.format("Batch %s started (completed %s changes so far)", batchCounter, documentCounter);
+        logger.info(msg);
+    }
+    
+    private void logBatchDetails(int batchCounter, int filteredChangesSize) {
+        String msg = String.format("Batch %s contains %s changes", batchCounter, filteredChangesSize);
+        logger.info(msg);
+    }
+    
+    private int processChangesBatch(Changes changes) throws AttachmentException, DocumentStoreException {
+        return processOneChangesBatch(changes);
+    }
+    
+    private void handleCheckpoint(long lastSeq) {
+        try {
+            this.putCheckpoint(String.valueOf(lastSeq));
+        } catch (DocumentStoreException e) {
+            logger.log(Level.WARNING, "Failed to put checkpoint doc, next replication will start from previous checkpoint", e);
+        }
+    }
+    
+    private void logBatchCompletion(int batchCounter, int changesProcessed, long batchStartTime) {
+        long batchEndTime = System.currentTimeMillis();
+        String msg = String.format("Batch %s completed in %sms (processed %s changes)", batchCounter, batchEndTime - batchStartTime, changesProcessed);
+        logger.info(msg);
+    }
+    
+    private void logReplicationCompletion(long startTime) {
         long endTime = System.currentTimeMillis();
         long deltaTime = endTime - startTime;
         String msg;
         if (this.state.cancel) {
-            msg = String.format(Locale.ENGLISH,
-                            "Push canceled after %sms (%s changes processed)",
-                            deltaTime,
-                            this.state.documentCounter
-                    );
+            msg = String.format(Locale.ENGLISH, "Push canceled after %sms (%s changes processed)", deltaTime, this.state.documentCounter);
         } else {
-            msg = String.format(Locale.ENGLISH,
-                    "Push completed in %sms (%s total changes processed)",
-                    deltaTime,
-                    this.state.documentCounter
-            );
+            msg = String.format(Locale.ENGLISH, "Push completed in %sms (%s total changes processed)", deltaTime, this.state.documentCounter);
         }
         logger.info(msg);
     }
