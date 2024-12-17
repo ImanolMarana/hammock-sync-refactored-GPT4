@@ -703,87 +703,61 @@ public class DatabaseImpl implements Database, org.hammock.sync.documentstore.ad
 
 
         try {
-
-            // before starting the tx, get the 'new winner' and see if we need to prepare its
-            // attachments
             final DocumentRevisionTree docTree = get(queue.submit(new GetAllRevisionsOfDocumentCallable(docId, attachmentsDir, attachmentStreamFactory)));
             if (!docTree.hasConflicts()) {
-                return;
+                return; // Early exit if no conflicts
             }
-            DocumentRevision newWinner = null;
-            try {
-                newWinner = resolver.resolve(docId, docTree.leafRevisions(true));
-            } catch (Exception e) {
-                logger.log(Level.SEVERE, "Exception when calling ConflictResolver", e);
-            }
-            if (newWinner == null) {
-                // resolve() threw an exception or returned null, exit early
-                return;
-            }
-
-            final String revIdKeep = newWinner.getRevision();
-            if (revIdKeep == null) {
-                throw new IllegalArgumentException("Winning revision must have a revision" +
-                        " id");
-            }
-
-            final DocumentRevision newWinnerTx = newWinner;
-            get(queue.submitTransaction(
-                    new SQLCallable<Void>() {
-                        @Override
-                        public Void call(SQLDatabase db) throws Exception {
-
-                            new ResolveConflictsForDocumentCallable(docTree, revIdKeep).call(db);
-
-                            // is newWinnerTx a new or updated (as opposed to existing) revision?
-                            boolean isNewOrUpdatedRevision = false;
-                            if (newWinnerTx.getClass().equals(DocumentRevision.class)) {
-                                // user gave us a new DocumentRevision instance
-                                isNewOrUpdatedRevision = true;
-                            } else if (newWinnerTx instanceof InternalDocumentRevision) {
-                                // user gave us an existing InternalDocumentRevision instance - did the body or attachments change?
-                                InternalDocumentRevision newWinnerTxInternal = (InternalDocumentRevision)newWinnerTx;
-                                if (newWinnerTxInternal.isBodyModified()) {
-                                    isNewOrUpdatedRevision = true;
-                                } else if (newWinnerTxInternal.getAttachments() != null) {
-                                    if (newWinnerTxInternal.getAttachments().hasChanged()) {
-                                        isNewOrUpdatedRevision = true;
-                                    }
-                                }
-                            }
-
-                            // if this is a new or modified revision: graft the new revision on
-                            if (isNewOrUpdatedRevision) {
-
-                                // We need to work out which of the attachments for the revision are ones
-                                // we can copy over because they exist in the attachment store already and
-                                // which are new, that we need to prepare for insertion.
-                                Map<String, Attachment> attachments = newWinnerTx.getAttachments() != null ?
-                                        newWinnerTx.getAttachments() : new HashMap<String, Attachment>();
-                                final Map<String, PreparedAttachment> preparedNewAttachments =
-                                        AttachmentManager.prepareAttachments(attachmentsDir,
-                                                attachmentStreamFactory,
-                                                AttachmentManager.findNewAttachments(attachments));
-                                final Map<String, SavedAttachment> existingAttachments =
-                                        AttachmentManager.findExistingAttachments(attachments);
-
-                                new UpdateDocumentFromRevisionCallable(newWinnerTx,
-                                        preparedNewAttachments,
-                                        existingAttachments, attachmentsDir, attachmentStreamFactory).call(db);
-                            }
-                            return null;
-                        }
-                    }));
+            processConflict(docTree, resolver, docId);
         } catch (ExecutionException e) {
             logger.log(Level.SEVERE, "Failed to resolve Conflicts", e);
             Throwable cause = e.getCause();
-            if (cause != null) {
-                if (cause instanceof IllegalArgumentException) {
-                    throw (IllegalArgumentException) cause;
-                }
+            if (cause instanceof IllegalArgumentException) {
+                throw (IllegalArgumentException) cause;
             }
         }
-
+    }
+    
+    private void processConflict(final DocumentRevisionTree docTree, final ConflictResolver resolver, final String docId) throws ExecutionException {
+        DocumentRevision newWinner = resolver.resolve(docId, docTree.leafRevisions(true));
+        if (newWinner == null) {
+            return; // Resolver returned null or an exception occurred
+        }
+    
+        final String revIdKeep = newWinner.getRevision();
+        if (revIdKeep == null) {
+            throw new IllegalArgumentException("Winning revision must have a revision id");
+        }
+    
+        final DocumentRevision newWinnerTx = newWinner;
+        
+        get(queue.submitTransaction(
+            new SQLCallable<Void>() {
+                @Override
+                public Void call(SQLDatabase db) throws Exception {
+                    new ResolveConflictsForDocumentCallable(docTree, revIdKeep).call(db);
+                    if (isNewOrUpdatedRevision(newWinnerTx)) {
+                        updateNewWinner(db, newWinnerTx);
+                    }
+                    return null;
+                }
+            }
+        ));
+    }
+    
+    private boolean isNewOrUpdatedRevision(DocumentRevision revision) {
+        if (revision instanceof InternalDocumentRevision) {
+            InternalDocumentRevision internalRev = (InternalDocumentRevision)revision;
+            return internalRev.isBodyModified() || (internalRev.getAttachments() != null && internalRev.getAttachments().hasChanged());
+        }
+        return true; // Treat as new by default
+    }
+    
+    private void updateNewWinner(SQLDatabase db, DocumentRevision newWinner) throws Exception {
+        Map<String, Attachment> attachments = newWinner.getAttachments() != null ? newWinner.getAttachments() : new HashMap<>();
+        Map<String, PreparedAttachment> preparedNewAttachments = AttachmentManager.prepareAttachments(attachmentsDir, attachmentStreamFactory, AttachmentManager.findNewAttachments(attachments));
+        Map<String, SavedAttachment> existingAttachments = AttachmentManager.findExistingAttachments(attachments);
+    
+        new UpdateDocumentFromRevisionCallable(newWinner, preparedNewAttachments, existingAttachments, attachmentsDir, attachmentStreamFactory).call(db);
     }
 
     /**
